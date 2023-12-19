@@ -549,6 +549,7 @@ class MixedCatalog(dict):
         Args:
             jsbsim_props (list): list of 'name_jsbsim (access)' of jsbsim properties
         """
+        jsbsim_props = jsbsim_props.rstrip('\r\n').split('\n')
         for jsbsim_prop in jsbsim_props:
             [name_jsbsim, access] = jsbsim_prop.split(" ")
             access = re.sub(r"[\(\)]", "", access)  # remove parenthesis from the flag
