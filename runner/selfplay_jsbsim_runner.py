@@ -1,9 +1,12 @@
 import torch
 import logging
+import time
 import numpy as np
 from typing import List
 from .base_runner import Runner, ReplayBuffer
 from .jsbsim_runner import JSBSimRunner
+
+from envs.JSBSim.core.catalog import Catalog as c
 
 
 def _t2n(x):
@@ -274,43 +277,235 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         opponent_idx = self.all_args.render_opponent_index
         dir_list = str(self.run_dir).split('/')
         file_path = '/'.join(dir_list[:dir_list.index('results')+1])
-        self.policy.actor.load_state_dict(torch.load(str(self.model_dir)+ f'/actor_{idx}.pt'))
+        
+        # Load models trained for Heading task here
+        self.policy.actor.load_state_dict(torch.load(
+            str(self.model_dir) + f'/actor_latest.pt', map_location=torch.device('cpu')))
         self.policy.prep_rollout()
-        self.eval_opponent_policy.actor.load_state_dict(torch.load(str(self.model_dir) + f'/actor_{opponent_idx}.pt'))
+        self.eval_opponent_policy.actor.load_state_dict(torch.load(
+            str(self.model_dir) + f'/actor_latest.pt', map_location=torch.device('cpu')))
         self.eval_opponent_policy.prep_rollout()
+
+        env = self.envs.envs[0]
+        state_var = env.task.state_var
+        action_var = env.task.action_var
+        all_vars = state_var + action_var + [c.position_long_gc_deg,
+                                             c.position_lat_geod_deg,
+                                             ]
+
+        # Created logic for following another aircraft in PursueAgent
+        pursue_agent = PursueAgent(env, 'A0100')
+        maneuver_agent = ManeuverAgent(env, 'B0100')
+
+        res_filepath = f'{self.run_dir}/{self.experiment_name}_{time.strftime("%m_%d_%H_%M_%S")}.csv'
+        print(res_filepath)
+        with open(res_filepath, "w") as f:
+            res = ", ".join([x.name_jsbsim for x in all_vars])
+            f.write(res + '\n')
+
         logging.info("\nStart render ...")
+        out_path = f'{file_path}/{self.experiment_name}.txt.acmi'
+        print(out_path)
         render_episode_rewards = 0
         render_obs = self.envs.reset()
-        self.envs.render(mode='txt', filepath=f'{file_path}/{self.experiment_name}.txt.acmi')
-        render_masks = np.ones((1, *self.buffer.masks.shape[2:]), dtype=np.float32)
-        render_rnn_states = np.zeros((1, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
+        self.envs.render(mode='txt', filepath=out_path)
+        render_masks = np.ones(
+            (1, *self.buffer.masks.shape[2:]), dtype=np.float32)
+        render_rnn_states = np.zeros(
+            (1, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
         render_opponent_obs = render_obs[:, self.num_agents // 2:, ...]
         render_obs = render_obs[:, :self.num_agents // 2, ...]
         render_opponent_masks = np.ones_like(render_masks, dtype=np.float32)
-        render_opponent_rnn_states = np.zeros_like(render_rnn_states, dtype=np.float32)
+        render_opponent_rnn_states = np.zeros_like(
+            render_rnn_states, dtype=np.float32)
         while True:
             self.policy.prep_rollout()
+            actor_input = [np.concatenate(render_obs), np.concatenate(render_rnn_states),
+                np.concatenate(render_masks), True]
+
             render_actions, render_rnn_states = self.policy.act(np.concatenate(render_obs),
-                                                                np.concatenate(render_rnn_states),
-                                                                np.concatenate(render_masks),
+                                                                np.concatenate(
+                                                                    render_rnn_states),
+                                                                np.concatenate(
+                                                                    render_masks),
                                                                 deterministic=True)
+
             render_actions = np.expand_dims(_t2n(render_actions), axis=0)
             render_rnn_states = np.expand_dims(_t2n(render_rnn_states), axis=0)
             render_opponent_actions, render_opponent_rnn_states \
                 = self.eval_opponent_policy.act(np.concatenate(render_opponent_obs),
-                                                np.concatenate(render_opponent_rnn_states),
-                                                np.concatenate(render_opponent_masks),
+                                                np.concatenate(
+                                                    render_opponent_rnn_states),
+                                                np.concatenate(
+                                                    render_opponent_masks),
                                                 deterministic=True)
-            render_opponent_actions = np.expand_dims(_t2n(render_opponent_actions), axis=0)
-            render_opponent_rnn_states = np.expand_dims(_t2n(render_opponent_rnn_states), axis=0)
-            render_actions = np.concatenate((render_actions, render_opponent_actions), axis=1)
+            render_opponent_actions = np.expand_dims(
+                _t2n(render_opponent_actions), axis=0)
+            render_opponent_rnn_states = np.expand_dims(
+                _t2n(render_opponent_rnn_states), axis=0)
+            
+            render_actions = np.concatenate(
+                (render_actions, render_opponent_actions), axis=1)
             # Obser reward and next obs
-            render_obs, render_rewards, render_dones, render_infos = self.envs.step(render_actions)
+            render_obs, render_rewards, render_dones, render_infos = self.envs.step(
+                render_actions)
+
+            # Get observations and set target values for each agent separately
+            # We can pursue agent follow the other aircraft this way
+            render_obs = pursue_agent.get_obs(env, env.task)
+            render_opponent_obs = maneuver_agent.get_obs(env, env.task)
+            render_obs = render_obs.reshape((1, 1, 12))
+            render_opponent_obs = render_opponent_obs.reshape((1, 1, 12))
+
             render_rewards = render_rewards[:, :self.num_agents // 2, ...]
             render_episode_rewards += render_rewards
-            self.envs.render(mode='txt', filepath=f'{file_path}/{self.experiment_name}.txt.acmi')
+            # self.envs.render(mode='txt', filepath=out_path)
             if render_dones.all():
                 break
-            render_opponent_obs = render_obs[:, self.num_agents // 2:, ...]
-            render_obs = render_obs[:, :self.num_agents // 2, ...]
+
+            renders = env.agents['A0100'].get_property_values(all_vars)
+            renders = [round(x, 3) for x in renders]
+
+            with open(res_filepath, "a") as f:
+                res = ", ".join([str(x) for x in renders])
+                f.write(res + '\n')
+                
         print(render_episode_rewards)
+
+
+class BaselineAgent():
+    def __init__(self, agent_id) -> None:
+        self.agent_id = agent_id
+
+    def reset(self):
+        self.rnn_states = np.zeros((1, 1, 128))
+
+    def set_delta_value(self, env, task):
+        raise NotImplementedError
+
+    def get_action(self, env, task):
+        delta_value = self.set_delta_value(env, task)
+        observation = self.get_observation(env, task, delta_value)
+        _action, self.rnn_states = self.actor(observation, self.rnn_states)
+        action = _action.detach().cpu().numpy().squeeze()
+        return action
+
+    def get_obs(self, env, task):
+        # print(f"{self.agent_id} :", env.agents[self.agent_id].get_property_value(
+        #     c.target_altitude_ft))
+        self.set_delta_value(env, task)
+        observation = env.task.get_obs(env, self.agent_id)
+        return observation
+
+
+class PursueAgent(BaselineAgent):
+    def __init__(self, env, agent_id) -> None:
+        super().__init__(agent_id)
+
+    def set_delta_value(self, env, task):
+        # NOTE: only adapt for 1v1
+        ego_uid, enm_uid = list(env.agents.keys())[0], list(
+            env.agents.keys())[1]
+
+        print(ego_uid, enm_uid)
+        ego_x, ego_y, ego_z = env.agents[ego_uid].get_position()
+        ego_vx, ego_vy, ego_vz = env.agents[ego_uid].get_velocity()
+        enm_x, enm_y, enm_z = env.agents[enm_uid].get_position()
+        # delta altitude
+        delta_altitude = enm_z - ego_z
+        # delta heading
+        ego_v = np.linalg.norm([ego_vx, ego_vy])
+        delta_x, delta_y = enm_x - ego_x, enm_y - ego_y
+        R = np.linalg.norm([delta_x, delta_y])
+        proj_dist = delta_x * ego_vx + delta_y * ego_vy
+        ego_AO = np.arccos(np.clip(proj_dist / (R * ego_v + 1e-8), -1, 1))
+        side_flag = np.sign(np.cross([ego_vx, ego_vy], [delta_x, delta_y]))
+        delta_heading = ego_AO * side_flag
+        # delta velocity
+        delta_velocity = env.agents[enm_uid].get_property_value(c.velocities_u_mps) - \
+            env.agents[ego_uid].get_property_value(c.velocities_u_mps)
+
+        env.agents[self.agent_id].set_property_value(
+            c.target_altitude_ft, enm_z * 3.281)
+        cur_heading = env.agents[self.agent_id].get_property_value(
+            c.attitude_heading_true_rad)
+        delta_heading = ((delta_heading * 180) + 360) % 360
+        new_heading = cur_heading + delta_heading
+        env.agents[self.agent_id].set_property_value(
+            c.target_heading_deg, new_heading)
+        env.agents[self.agent_id].set_property_value(c.velocities_u_mps,
+                                                     env.agents[enm_uid].get_property_value(
+                                                         c.velocities_u_mps)
+                                                     )
+
+        return np.array([delta_altitude, delta_heading, delta_velocity])
+
+
+class ManeuverAgent(BaselineAgent):
+    def __init__(self, env, agent_id) -> None:
+        super().__init__(agent_id)
+        self.init_heading = None
+
+        self.turn_interval = 30
+
+        self.target_altitude_list = [6000] * 6
+        self.target_velocity_list = [243] * 6
+
+        self.heading_turn_counts = 0
+
+        self.max_heading_increment = 180
+        self.max_altitude_increment = 7000
+        self.max_velocities_u_increment = 100
+        self.check_interval = 10
+        self.increment_size = [0.2, 0.4, 0.6, 0.8, 1.0] + [1.0] * 100
+
+    def reset(self):
+        self.step = 0
+        self.rnn_states = np.zeros((1, 1, 128))
+        self.init_heading = None
+
+    def set_delta_value(self, env, task):
+        uid = self.agent_id
+        cur_heading = env.agents[uid].get_property_value(
+            c.attitude_heading_true_rad)
+        if self.init_heading is None:
+            env.agents[uid].set_property_value(c.heading_check_time, 0)
+            self.init_heading = cur_heading
+            env.agents[uid].set_property_value(c.target_altitude_ft, 20000)
+
+        check_time = env.agents[uid].get_property_value(c.heading_check_time)
+        if env.agents[uid].get_property_value(c.simulation_sim_time_sec) >= check_time:
+            delta = self.increment_size[self.heading_turn_counts]
+            delta_heading = env.np_random.uniform(
+                -delta, delta) * self.max_heading_increment
+            delta_altitude = env.np_random.uniform(
+                -delta, delta) * self.max_altitude_increment
+            delta_velocities_u = env.np_random.uniform(
+                -delta, delta) * self.max_velocities_u_increment
+            new_heading = env.agents[uid].get_property_value(
+                c.target_heading_deg) + delta_heading
+            new_heading = (new_heading + 360) % 360
+            new_altitude = env.agents[uid].get_property_value(
+                c.target_altitude_ft) + delta_altitude
+            new_velocities_u = env.agents[uid].get_property_value(
+                c.target_velocities_u_mps) + delta_velocities_u
+            env.agents[uid].set_property_value(
+                c.target_heading_deg, new_heading)
+            env.agents[uid].set_property_value(
+                c.target_altitude_ft, new_altitude)
+            env.agents[uid].set_property_value(
+                c.target_velocities_u_mps, new_velocities_u)
+            env.agents[uid].set_property_value(
+                c.heading_check_time, check_time + self.check_interval)
+            self.heading_turn_counts += 1
+            print(f'target_heading:{new_heading} '
+                  f'target_altitude_ft:{new_altitude} target_velocities_u_mps:{new_velocities_u}')
+
+        delta_heading = env.agents[uid].get_property_value(c.delta_heading)
+
+        delta_altitude = env.agents[uid].get_property_value(c.target_altitude_ft) / 3.281 - \
+            env.agents[uid].get_property_value(c.position_h_sl_m)
+        
+        delta_velocity = 243 - \
+            env.agents[uid].get_property_value(c.velocities_u_mps)
+        return np.array([delta_altitude, delta_heading, delta_velocity])
